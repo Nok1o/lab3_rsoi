@@ -1234,3 +1234,8 @@ buildNumber.properties
 .mvn/timing.properties
 # https://github.com/takari/maven-wrapper#usage-without-binary-jar
 .mvn/wrapper/maven-wrapper.jar
+
+# Go module and database initialization scripts are application sources.
+!/backend/go.mod
+!/postgres/scripts/
+!/postgres/scripts/*.sql

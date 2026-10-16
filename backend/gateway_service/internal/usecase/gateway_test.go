@@ -17,6 +17,8 @@ type fakeLibrary struct {
 	book        domain.LibraryBook
 	available   int
 	returnCalls int
+	getBookErr  error
+	returnErr   error
 }
 
 func (service *fakeLibrary) ListLibrariesByCity(_ context.Context, city string, _ pagination.PageToken) (pagination.Page[domain.Library], error) {
@@ -41,6 +43,9 @@ func (service *fakeLibrary) GetLibraryByUID(_ context.Context, libraryUID uuid.U
 }
 
 func (service *fakeLibrary) GetBookByUID(_ context.Context, libraryUID, bookUID uuid.UUID) (domain.LibraryBook, error) {
+	if service.getBookErr != nil {
+		return domain.LibraryBook{}, service.getBookErr
+	}
 	if libraryUID != service.library.Id || bookUID != service.book.Id {
 		return domain.LibraryBook{}, domain.ErrBookNotFound
 	}
@@ -63,18 +68,28 @@ func (service *fakeLibrary) ReserveBook(ctx context.Context, libraryUID, bookUID
 }
 
 func (service *fakeLibrary) ReturnBook(_ context.Context, libraryUID, bookUID uuid.UUID, condition domain.BookCondition) error {
+	service.returnCalls++
+	if service.returnErr != nil {
+		return service.returnErr
+	}
 	if libraryUID != service.library.Id || bookUID != service.book.Id {
 		return domain.ErrBookNotFound
 	}
 	service.available++
-	service.returnCalls++
 	service.book.Condition = condition
 	return nil
 }
 
-type fakeRating struct{ items map[string]domain.Rating }
+type fakeRating struct {
+	items  map[string]domain.Rating
+	getErr error
+	addErr error
+}
 
 func (service *fakeRating) GetByUsername(_ context.Context, username string) (domain.Rating, error) {
+	if service.getErr != nil {
+		return domain.Rating{}, service.getErr
+	}
 	rating, exists := service.items[username]
 	if !exists {
 		return domain.Rating{}, domain.ErrRatingNotFound
@@ -91,6 +106,9 @@ func (service *fakeRating) Create(_ context.Context, rating domain.Rating) error
 }
 
 func (service *fakeRating) AddStars(_ context.Context, username string, delta int) (domain.Rating, error) {
+	if service.addErr != nil {
+		return domain.Rating{}, service.addErr
+	}
 	rating, exists := service.items[username]
 	if !exists {
 		return domain.Rating{}, domain.ErrRatingNotFound
@@ -104,6 +122,19 @@ func (service *fakeRating) AddStars(_ context.Context, username string, delta in
 	}
 	service.items[username] = rating
 	return rating, nil
+}
+
+type fakeReturnQueue struct {
+	jobs []ReturnJob
+	err  error
+}
+
+func (queue *fakeReturnQueue) Enqueue(_ context.Context, job ReturnJob) error {
+	if queue.err != nil {
+		return queue.err
+	}
+	queue.jobs = append(queue.jobs, job)
+	return nil
 }
 
 type fakeReservation struct {
@@ -168,6 +199,11 @@ func (service *fakeReservation) Return(_ context.Context, reservationUID uuid.UU
 }
 
 func newTestGateway() (*GatewayUseCase, *fakeLibrary, *fakeRating, *fakeReservation) {
+	gateway, library, rating, reservation, _ := newTestGatewayWithQueue()
+	return gateway, library, rating, reservation
+}
+
+func newTestGatewayWithQueue() (*GatewayUseCase, *fakeLibrary, *fakeRating, *fakeReservation, *fakeReturnQueue) {
 	library := &fakeLibrary{
 		library:   domain.Library{Id: uuid.New(), Name: "Library", City: "Москва", Address: "Address"},
 		book:      domain.LibraryBook{Book: domain.Book{Id: uuid.New(), Name: "Book", Condition: domain.ConditionExcellent}},
@@ -175,7 +211,8 @@ func newTestGateway() (*GatewayUseCase, *fakeLibrary, *fakeRating, *fakeReservat
 	}
 	rating := &fakeRating{items: make(map[string]domain.Rating)}
 	reservation := &fakeReservation{items: make(map[uuid.UUID]domain.Reservation)}
-	return NewGatewayUseCase(library, rating, reservation), library, rating, reservation
+	returnQueue := &fakeReturnQueue{}
+	return NewGatewayUseCase(library, rating, reservation, returnQueue), library, rating, reservation, returnQueue
 }
 
 func TestGetRatingDoesNotCreateMissingRating(t *testing.T) {
@@ -270,5 +307,102 @@ func TestRentalLimitAndCompensation(t *testing.T) {
 	}
 	if library.available != 1 || library.returnCalls != 1 {
 		t.Fatalf("compensation failed: available=%d, returnCalls=%d", library.available, library.returnCalls)
+	}
+}
+
+func TestReturnQueuesBookRestoreWhenLibraryIsUnavailable(t *testing.T) {
+	gateway, library, rating, _, returnQueue := newTestGatewayWithQueue()
+	tillDate := time.Date(2021, 10, 11, 0, 0, 0, 0, time.UTC)
+	details, err := gateway.Rent(context.Background(), "alice", library.library.Id, library.book.Id, tillDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	library.getBookErr = &DependencyError{Service: "library", Cause: errors.New("library unavailable")}
+	if err := gateway.Return(
+		context.Background(),
+		details.Reservation.Id,
+		"alice",
+		domain.ConditionExcellent,
+		tillDate,
+	); err != nil {
+		t.Fatalf("Return() error = %v, want successful deferred return", err)
+	}
+
+	if len(returnQueue.jobs) != 1 {
+		t.Fatalf("queued jobs = %d, want 1", len(returnQueue.jobs))
+	}
+	job := returnQueue.jobs[0]
+	if job.Stage != ReturnStageRestoreBook ||
+		job.ReservationUID != details.Reservation.Id ||
+		job.LibraryUID != library.library.Id ||
+		job.BookUID != library.book.Id ||
+		job.Username != "alice" ||
+		job.OriginalCondition != "" ||
+		job.ReturnedCondition != domain.ConditionExcellent {
+		t.Fatalf("queued job = %+v", job)
+	}
+	if rating.items["alice"].StarsCount != initialStars {
+		t.Fatalf("rating changed before queued book restore: %+v", rating.items["alice"])
+	}
+}
+
+func TestReturnQueuesOnlyRatingAfterBookWasRestored(t *testing.T) {
+	gateway, library, rating, _, returnQueue := newTestGatewayWithQueue()
+	tillDate := time.Date(2021, 10, 11, 0, 0, 0, 0, time.UTC)
+	details, err := gateway.Rent(context.Background(), "alice", library.library.Id, library.book.Id, tillDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rating.getErr = errors.New("rating unavailable")
+	rating.addErr = &DependencyError{Service: "rating", Cause: errors.New("rating unavailable")}
+	if err := gateway.Return(
+		context.Background(),
+		details.Reservation.Id,
+		"alice",
+		domain.ConditionExcellent,
+		tillDate,
+	); err != nil {
+		t.Fatalf("Return() error = %v, want successful deferred return", err)
+	}
+
+	if library.available != 1 {
+		t.Fatalf("available books = %d, want 1", library.available)
+	}
+	if len(returnQueue.jobs) != 1 {
+		t.Fatalf("queued jobs = %d, want 1", len(returnQueue.jobs))
+	}
+	if job := returnQueue.jobs[0]; job.Stage != ReturnStageUpdateRating {
+		t.Fatalf("queued stage = %s, want %s", job.Stage, ReturnStageUpdateRating)
+	}
+}
+
+func TestReturnDoesNotQueuePermanentFailure(t *testing.T) {
+	gateway, library, _, _, queue := newTestGatewayWithQueue()
+	date := time.Date(2021, 10, 11, 0, 0, 0, 0, time.UTC)
+	details, err := gateway.Rent(context.Background(), "alice", library.library.Id, library.book.Id, date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	library.returnErr = domain.ErrBookNotFound
+	err = gateway.Return(context.Background(), details.Reservation.Id, "alice", domain.ConditionExcellent, date)
+	if !errors.Is(err, domain.ErrBookNotFound) || len(queue.jobs) != 0 {
+		t.Fatalf("permanent failure = %v, queued jobs=%d", err, len(queue.jobs))
+	}
+}
+
+func TestReturnReportsPublishFailure(t *testing.T) {
+	gateway, library, _, _, queue := newTestGatewayWithQueue()
+	date := time.Date(2021, 10, 11, 0, 0, 0, 0, time.UTC)
+	details, err := gateway.Rent(context.Background(), "alice", library.library.Id, library.book.Id, date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	library.returnErr = &DependencyError{Service: "library", Cause: errors.New("timeout")}
+	queue.err = errors.New("Redis unavailable")
+	err = gateway.Return(context.Background(), details.Reservation.Id, "alice", domain.ConditionExcellent, date)
+	if !errors.Is(err, queue.err) || len(queue.jobs) != 0 {
+		t.Fatalf("publish failure = %v", err)
 	}
 }

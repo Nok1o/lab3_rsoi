@@ -9,10 +9,16 @@ services:
       LIBRARY_SERVICE_URL: http://library-service:8060
       RATING_SERVICE_URL: http://rating-service:8050
       RESERVATION_SERVICE_URL: http://reservation-service:8070
+      REDIS_URL: redis://redis:6379/0
     depends_on:
-      - library-service
-      - rating-service
-      - reservation-service
+      library-service:
+        condition: service_started
+      rating-service:
+        condition: service_started
+      reservation-service:
+        condition: service_started
+      redis:
+        condition: service_healthy
     ports:
       - "${GATEWAY_PORT:-8080}:8080"
 
@@ -58,6 +64,20 @@ services:
     ports:
       - "${LIBRARY_PORT:-8060}:8060"
 
+  redis:
+    image: redis:7.4-alpine
+    restart: on-failure
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   postgres:
     image: library/postgres:13
     restart: on-failure
@@ -78,3 +98,4 @@ services:
 
 volumes:
   db-data:
+  redis-data:

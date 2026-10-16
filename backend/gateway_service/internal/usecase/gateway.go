@@ -41,6 +41,10 @@ type ReservationService interface {
 	Return(ctx context.Context, reservationUID uuid.UUID, username string, returnDate time.Time) (domain.Reservation, error)
 }
 
+type ReturnQueue interface {
+	Enqueue(ctx context.Context, job ReturnJob) error
+}
+
 type ReservationDetails struct {
 	Reservation domain.Reservation
 	Library     domain.Library
@@ -52,11 +56,20 @@ type GatewayUseCase struct {
 	libraries    LibraryService
 	ratings      RatingService
 	reservations ReservationService
+	returnQueue  ReturnQueue
 }
 
-func NewGatewayUseCase(libraries LibraryService, ratings RatingService, reservations ReservationService) *GatewayUseCase {
+func NewGatewayUseCase(
+	libraries LibraryService,
+	ratings RatingService,
+	reservations ReservationService,
+	returnQueue ReturnQueue,
+) *GatewayUseCase {
 	return &GatewayUseCase{
-		libraries: libraries, ratings: ratings, reservations: reservations,
+		libraries:    libraries,
+		ratings:      ratings,
+		reservations: reservations,
+		returnQueue:  returnQueue,
 	}
 }
 
@@ -237,38 +250,64 @@ func (useCase *GatewayUseCase) Return(
 	if reservation.Status != domain.StatusRented {
 		return domain.ErrReservationNotRented
 	}
-	book, err := useCase.libraries.GetBookByUID(ctx, reservation.LibraryId, reservation.BookId)
-	if err != nil {
-		return err
-	}
-	if _, err := useCase.ensureRating(ctx, username); err != nil {
-		return err
-	}
 	completed, err := useCase.reservations.Return(ctx, reservationUID, username, returnDate)
 	if err != nil {
 		return err
 	}
 	// Once the reservation has been closed, continue the remaining steps even
 	// if the original HTTP client disconnects.
-	completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	completionCtx := context.WithoutCancel(ctx)
+	job := ReturnJob{
+		ReservationUID:    reservationUID,
+		LibraryUID:        reservation.LibraryId,
+		BookUID:           reservation.BookId,
+		Username:          username,
+		ReturnedCondition: condition,
+		Expired:           completed.Status == domain.StatusExpired,
+	}
+	libraryCtx, cancelLibrary := context.WithTimeout(completionCtx, 10*time.Second)
+	book, err := useCase.libraries.GetBookByUID(libraryCtx, reservation.LibraryId, reservation.BookId)
+	cancelLibrary()
+	if err != nil {
+		job.Stage = ReturnStageRestoreBook
+		return useCase.enqueueReturnJob(completionCtx, job, err)
+	}
+	job.OriginalCondition = book.Condition
+
+	restoreCtx, cancelRestore := context.WithTimeout(completionCtx, 10*time.Second)
+	err = useCase.libraries.ReturnBook(restoreCtx, reservation.LibraryId, reservation.BookId, condition)
+	cancelRestore()
+	if err != nil {
+		job.Stage = ReturnStageRestoreBook
+		return useCase.enqueueReturnJob(completionCtx, job, err)
+	}
+	job.Stage = ReturnStageUpdateRating
+	ratingCtx, cancelRating := context.WithTimeout(completionCtx, 10*time.Second)
+	_, err = useCase.ratings.AddStars(ratingCtx, username, job.RatingDelta())
+	cancelRating()
+	if err != nil {
+		return useCase.enqueueReturnJob(completionCtx, job, err)
+	}
+	return nil
+}
+
+func (useCase *GatewayUseCase) enqueueReturnJob(ctx context.Context, job ReturnJob, cause error) error {
+	if !IsRetryable(cause) {
+		return cause
+	}
+	if useCase.returnQueue == nil {
+		return fmt.Errorf("return operation cannot be deferred: queue is not configured: %w", cause)
+	}
+	enqueueCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := useCase.libraries.ReturnBook(completionCtx, reservation.LibraryId, reservation.BookId, condition); err != nil {
-		log.Error("reservation closed but book availability not restored", "reservation_uid", reservationUID, "error", err)
-		return err
+	if err := useCase.returnQueue.Enqueue(enqueueCtx, job); err != nil {
+		return fmt.Errorf("enqueue deferred return after %v: %w", cause, err)
 	}
-	delta := 0
-	if completed.Status == domain.StatusExpired {
-		delta -= 10
-	}
-	if condition != book.Condition {
-		delta -= 10
-	}
-	if delta == 0 {
-		delta = 1
-	}
-	if _, err := useCase.ratings.AddStars(completionCtx, username, delta); err != nil {
-		log.Error("book returned but rating not updated", "reservation_uid", reservationUID, "error", err)
-		return err
-	}
+	log.Warn(
+		"return operation deferred",
+		"reservation_uid", job.ReservationUID,
+		"stage", job.Stage,
+		"error", cause,
+	)
 	return nil
 }

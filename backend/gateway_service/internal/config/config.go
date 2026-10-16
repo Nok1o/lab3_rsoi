@@ -12,6 +12,7 @@ type Config struct {
 	LibraryServiceURL     string
 	RatingServiceURL      string
 	ReservationServiceURL string
+	RedisURL              string
 }
 
 func Load() (Config, error) {
@@ -25,6 +26,7 @@ func Load() (Config, error) {
 		LibraryServiceURL:     envOrDefault("LIBRARY_SERVICE_URL", "http://localhost:8060"),
 		RatingServiceURL:      envOrDefault("RATING_SERVICE_URL", "http://localhost:8050"),
 		ReservationServiceURL: envOrDefault("RESERVATION_SERVICE_URL", "http://localhost:8070"),
+		RedisURL:              envOrDefault("REDIS_URL", "redis://localhost:6379/0"),
 	}, nil
 }
 
