@@ -141,7 +141,7 @@ func (handler *Handler) writeError(w stdhttp.ResponseWriter, err error) {
 		newErrorResponse().message(err.Error()).writeResponse(w, stdhttp.StatusConflict)
 	default:
 		log.Error("gateway request failed", "error", err)
-		newErrorResponse().message("upstream service error").writeResponse(w, stdhttp.StatusBadGateway)
+		newErrorResponse().message("upstream service error").writeResponse(w, stdhttp.StatusServiceUnavailable)
 	}
 }
 

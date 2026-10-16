@@ -156,6 +156,11 @@ func (client *Client) Return(
 	return reservation, nil
 }
 
+func (client *Client) Cancel(ctx context.Context, reservationUID uuid.UUID, username string) error {
+	path := "/api/v1/reservations/" + reservationUID.String()
+	return mapError(client.do(ctx, http.MethodDelete, path, username, nil, http.StatusNoContent, nil))
+}
+
 func (client *Client) do(
 	ctx context.Context,
 	method, path, username string,
@@ -202,6 +207,10 @@ func (client *Client) do(
 			serviceResponse.Message = http.StatusText(response.StatusCode)
 		}
 		return &serviceError{statusCode: response.StatusCode, message: serviceResponse.Message}
+	}
+	if result == nil {
+		_, _ = io.Copy(io.Discard, limitedBody)
+		return nil
 	}
 	if err := json.NewDecoder(limitedBody).Decode(result); err != nil {
 		return fmt.Errorf("decode reservation response: %w", err)

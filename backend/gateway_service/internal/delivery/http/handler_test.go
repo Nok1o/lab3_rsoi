@@ -3,6 +3,7 @@ package http_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,6 +24,7 @@ type stubGateway struct {
 	bookUID        uuid.UUID
 	reservationUID uuid.UUID
 	returnCalls    int
+	ratingErr      error
 }
 
 func (stub *stubGateway) details() usecase.ReservationDetails {
@@ -55,6 +57,9 @@ func (stub *stubGateway) ListBooks(_ context.Context, libraryUID uuid.UUID, show
 }
 
 func (stub *stubGateway) GetRating(_ context.Context, username string) (domain.Rating, error) {
+	if stub.ratingErr != nil {
+		return domain.Rating{}, stub.ratingErr
+	}
 	if username != "alice" {
 		stub.t.Errorf("username = %q", username)
 	}
@@ -83,6 +88,17 @@ func (stub *stubGateway) Return(_ context.Context, reservationUID uuid.UUID, use
 	}
 	stub.returnCalls++
 	return nil
+}
+
+func TestUnavailableDependencyReturns503(t *testing.T) {
+	stub := &stubGateway{t: t, ratingErr: &usecase.DependencyError{Service: "rating", Cause: errors.New("connection refused")}}
+	router := gatewayhttp.NewRouter(gatewayhttp.NewHandler(stub))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/rating", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"message":"upstream service error"`) {
+		t.Fatalf("unavailable dependency response: %d %s", response.Code, response.Body.String())
+	}
 }
 
 func TestGatewayRoutes(t *testing.T) {

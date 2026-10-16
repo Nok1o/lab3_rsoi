@@ -64,9 +64,9 @@ type pageResponse[T any] struct {
 
 type libraryResponse struct {
 	UID     uuid.UUID `json:"libraryUid"`
-	Name    string    `json:"name"`
-	Address string    `json:"address"`
-	City    string    `json:"city"`
+	Name    string    `json:"name,omitempty"`
+	Address string    `json:"address,omitempty"`
+	City    string    `json:"city,omitempty"`
 }
 
 type libraryBookResponse struct {
@@ -80,9 +80,9 @@ type libraryBookResponse struct {
 
 type bookInfoResponse struct {
 	UID    uuid.UUID `json:"bookUid"`
-	Name   string    `json:"name"`
-	Author string    `json:"author"`
-	Genre  string    `json:"genre"`
+	Name   string    `json:"name,omitempty"`
+	Author string    `json:"author,omitempty"`
+	Genre  string    `json:"genre,omitempty"`
 }
 
 type ratingResponse struct {

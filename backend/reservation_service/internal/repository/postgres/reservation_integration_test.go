@@ -69,4 +69,25 @@ func TestReservationPGRepo(t *testing.T) {
 	if err != nil || got.Status != domain.StatusReturned {
 		t.Fatalf("GetByUIDAndUsername() after return = (%+v, %v)", got, err)
 	}
+	if err := repository.Cancel(ctx, reservation.Id, reservation.Username); !errors.Is(err, domain.ErrReservationNotRented) {
+		t.Fatalf("completed reservation cancellation = %v", err)
+	}
+	active := reservation
+	active.Id = uuid.New()
+	if err := repository.Create(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Exec(context.Background(), "DELETE FROM reservation WHERE reservation_uid = $1", active.Id)
+	if err := repository.Cancel(ctx, active.Id, "other-user"); !errors.Is(err, domain.ErrReservationNotFound) {
+		t.Fatalf("wrong owner cancellation = %v", err)
+	}
+	if err := repository.Cancel(ctx, active.Id, active.Username); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.GetByUIDAndUsername(ctx, active.Id, active.Username); !errors.Is(err, domain.ErrReservationNotFound) {
+		t.Fatalf("cancelled reservation still exists: %v", err)
+	}
+	if err := repository.Cancel(ctx, active.Id, active.Username); !errors.Is(err, domain.ErrReservationNotFound) {
+		t.Fatalf("missing reservation cancellation = %v", err)
+	}
 }

@@ -58,6 +58,51 @@ func (repo *memoryReservationRepo) CompleteRental(_ context.Context, reservation
 	return nil
 }
 
+func (repo *memoryReservationRepo) Cancel(_ context.Context, uid uuid.UUID, username string) error {
+	item, err := repo.GetByUIDAndUsername(context.Background(), uid, username)
+	if err != nil {
+		return err
+	}
+	if item.Status != domain.StatusRented {
+		return domain.ErrReservationNotRented
+	}
+	delete(repo.items, uid)
+	return nil
+}
+
+func TestCancelChecksOwnerAndStatus(t *testing.T) {
+	repo := &memoryReservationRepo{items: make(map[uuid.UUID]domain.Reservation)}
+	useCase := NewReservationUseCase(repo)
+	ctx := context.Background()
+	item, err := useCase.Rent(ctx, "alice", uuid.New(), uuid.New(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := useCase.Cancel(ctx, item.Id, "bob"); !errors.Is(err, domain.ErrReservationNotFound) {
+		t.Fatalf("wrong owner: %v", err)
+	}
+	if err := useCase.Cancel(ctx, uuid.Nil, "alice"); !errors.Is(err, ErrInvalidReservation) {
+		t.Fatalf("invalid UID: %v", err)
+	}
+	if err := useCase.Cancel(ctx, item.Id, ""); !errors.Is(err, ErrInvalidReservation) {
+		t.Fatalf("invalid username: %v", err)
+	}
+	if err := useCase.Cancel(ctx, item.Id, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.items) != 0 {
+		t.Fatal("cancelled reservation remains")
+	}
+	item.Status = domain.StatusReturned
+	repo.items[item.Id] = item
+	if err := useCase.Cancel(ctx, item.Id, "alice"); !errors.Is(err, domain.ErrReservationNotRented) {
+		t.Fatalf("completed reservation: %v", err)
+	}
+	if len(repo.items) != 1 {
+		t.Fatal("completed reservation was removed")
+	}
+}
+
 func TestRentAndReturn(t *testing.T) {
 	for _, check := range []struct {
 		name       string

@@ -24,6 +24,7 @@ type ReservationUseCase interface {
 	GetByUIDAndUsername(ctx context.Context, reservationUID uuid.UUID, username string) (domain.Reservation, error)
 	Rent(ctx context.Context, username string, libraryUID, bookUID uuid.UUID, tillDate time.Time) (domain.Reservation, error)
 	Return(ctx context.Context, reservationUID uuid.UUID, username string, returnDate time.Time) (domain.Reservation, error)
+	Cancel(ctx context.Context, reservationUID uuid.UUID, username string) error
 }
 
 type Handler struct {
@@ -114,6 +115,18 @@ func (handler *Handler) Return(w stdhttp.ResponseWriter, request *stdhttp.Reques
 		return
 	}
 	writeJSON(w, stdhttp.StatusOK, toReservationResponse(reservation))
+}
+
+func (handler *Handler) Cancel(w stdhttp.ResponseWriter, request *stdhttp.Request) {
+	uid, ok := reservationUID(w, request)
+	if !ok {
+		return
+	}
+	if err := handler.reservations.Cancel(request.Context(), uid, request.Header.Get("X-User-Name")); err != nil {
+		handler.writeError(w, err)
+		return
+	}
+	w.WriteHeader(stdhttp.StatusNoContent)
 }
 
 func (handler *Handler) writeError(w stdhttp.ResponseWriter, err error) {

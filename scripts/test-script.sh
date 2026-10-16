@@ -1,32 +1,37 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-variant=${1:-${VARIANT}}
-service=${2:-${SERVICE_NAME}}
-port=${3:-${PORT_NUMBER}}
+variant=${1:-${VARIANT:-v4}}
+service=${2:-${SERVICE_NAME:-rating-service}}
+port=${3:-${PORT_NUMBER:-8050}}
 
 path=$(dirname "$0")
 
-timed() {
-  end=$(date +%s)
-  dt=$(("$end" - $1))
-  dd=$(("$dt" / 86400))
-  dt2=$(("$dt" - 86400 * "$dd"))
-  dh=$(("$dt2" / 3600))
-  dt3=$(("$dt2" - 3600 * "$dh"))
-  dm=$(("$dt3" / 60))
-  ds=$(("$dt3" - 60 * "$dm"))
+# Keep Newman runtime variables out of the tracked environment.
+test_environment=$(mktemp)
+cp "$variant/postman/environment.json" "$test_environment"
 
-  LC_NUMERIC=C printf "\nTotal runtime: %02d min %02d seconds\n" "$dm" "$ds"
+compose() {
+  if docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  else
+    docker-compose "$@"
+  fi
+}
+
+timed() {
+  local elapsed
+  elapsed=$(( $(date +%s) - $1 ))
+  LC_NUMERIC=C printf "\nTotal runtime: %02d min %02d seconds\n" "$((elapsed / 60))" "$((elapsed % 60))"
 }
 
 success() {
   newman run \
     --delay-request=100 \
     --folder=success \
-    --export-environment "$variant"/postman/environment.json \
-    --environment "$variant"/postman/environment.json \
+    --export-environment "$test_environment" \
+    --environment "$test_environment" \
     "$variant"/postman/collection.json
 }
 
@@ -36,7 +41,7 @@ step() {
 
   printf "=== Step %d: %s %s ===\n" "$step" "$operation" "$service"
 
-  docker compose "$operation" "$service"
+  compose "$operation" "$service"
   if [[ "$operation" == "start" ]]; then
     "$path"/wait-for.sh -t 120 "http://localhost:$port/manage/health" -- echo "Host localhost:$port is active"
   fi
@@ -44,15 +49,15 @@ step() {
   newman run \
     --delay-request=100 \
     --folder=step"$step" \
-    --export-environment "$variant"/postman/environment.json \
-    --environment "$variant"/postman/environment.json \
+    --export-environment "$test_environment" \
+    --environment "$test_environment" \
     "$variant"/postman/collection.json
 
   printf "=== Step %d completed ===\n" "$step"
 }
 
 start=$(date +%s)
-trap 'timed $start' EXIT
+trap 'rm -f "$test_environment"; timed "$start"' EXIT
 
 printf "=== Start test scenario ===\n"
 

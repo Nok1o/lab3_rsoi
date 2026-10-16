@@ -118,6 +118,23 @@ func (repository *ReservationPGRepo) CompleteRental(
 	return nil
 }
 
+func (repository *ReservationPGRepo) Cancel(ctx context.Context, reservationUID uuid.UUID, username string) error {
+	result, err := repository.pool.Exec(ctx, `
+		DELETE FROM reservation
+		WHERE reservation_uid = $1 AND username = $2 AND status = 'RENTED'
+	`, reservationUID, username)
+	if err != nil {
+		return fmt.Errorf("cancel reservation: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		if _, err := repository.GetByUIDAndUsername(ctx, reservationUID, username); err != nil {
+			return err
+		}
+		return domain.ErrReservationNotRented
+	}
+	return nil
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }

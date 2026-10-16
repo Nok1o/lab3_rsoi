@@ -38,6 +38,7 @@ type ReservationService interface {
 	CountByUsernameAndStatus(ctx context.Context, username string, status domain.ReservationStatus) (int, error)
 	GetByUIDAndUsername(ctx context.Context, reservationUID uuid.UUID, username string) (domain.Reservation, error)
 	Rent(ctx context.Context, username string, libraryUID, bookUID uuid.UUID, tillDate time.Time) (domain.Reservation, error)
+	Cancel(ctx context.Context, reservationUID uuid.UUID, username string) error
 	Return(ctx context.Context, reservationUID uuid.UUID, username string, returnDate time.Time) (domain.Reservation, error)
 }
 
@@ -149,11 +150,17 @@ func (useCase *GatewayUseCase) ListReservations(ctx context.Context, username st
 	for _, reservation := range reservations {
 		library, err := useCase.libraries.GetLibraryByUID(ctx, reservation.LibraryId)
 		if err != nil {
-			return nil, fmt.Errorf("get library for reservation %s: %w", reservation.Id, err)
+			if !IsRetryable(err) {
+				return nil, fmt.Errorf("get library for reservation %s: %w", reservation.Id, err)
+			}
+			library = domain.Library{Id: reservation.LibraryId}
 		}
 		book, err := useCase.libraries.GetBookByUID(ctx, reservation.LibraryId, reservation.BookId)
 		if err != nil {
-			return nil, fmt.Errorf("get book for reservation %s: %w", reservation.Id, err)
+			if !IsRetryable(err) {
+				return nil, fmt.Errorf("get book for reservation %s: %w", reservation.Id, err)
+			}
+			book = domain.LibraryBook{Book: domain.Book{Id: reservation.BookId}}
 		}
 		details = append(details, ReservationDetails{Reservation: reservation, Library: library, Book: book})
 	}
@@ -202,18 +209,18 @@ func (useCase *GatewayUseCase) Rent(
 	if err != nil {
 		return ReservationDetails{}, err
 	}
-	if _, err := useCase.libraries.ReserveBook(ctx, libraryUID, bookUID); err != nil {
-		return ReservationDetails{}, err
-	}
 	reservation, err := useCase.reservations.Rent(ctx, username, libraryUID, bookUID, tillDate)
 	if err != nil {
-		// Best-effort compensation for the library counter if creating the
-		// reservation failed. Keep it independent from client cancellation.
+		return ReservationDetails{}, err
+	}
+	if _, err := useCase.libraries.ReserveBook(ctx, libraryUID, bookUID); err != nil {
+		// Remove the new reservation when the library cannot lend the book.
+		// Compensation must still run if the original HTTP client disconnects.
 		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		if rollbackErr := useCase.libraries.ReturnBook(rollbackCtx, libraryUID, bookUID, book.Condition); rollbackErr != nil {
-			log.Error("failed to compensate book reservation", "library_uid", libraryUID, "book_uid", bookUID, "rent_error", err, "rollback_error", rollbackErr)
-			return ReservationDetails{}, fmt.Errorf("rent failed (%v) and book compensation failed: %v", err, rollbackErr)
+		if rollbackErr := useCase.reservations.Cancel(rollbackCtx, reservation.Id, username); rollbackErr != nil {
+			log.Error("failed to cancel reservation", "reservation_uid", reservation.Id, "rent_error", err, "rollback_error", rollbackErr)
+			return ReservationDetails{}, fmt.Errorf("reserve book failed (%v) and reservation compensation failed: %v", err, rollbackErr)
 		}
 		return ReservationDetails{}, err
 	}

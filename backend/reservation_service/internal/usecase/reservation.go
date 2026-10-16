@@ -23,6 +23,7 @@ type ReservationRepository interface {
 	GetByUIDAndUsername(ctx context.Context, reservationUID uuid.UUID, username string) (domain.Reservation, error)
 	Create(ctx context.Context, reservation domain.Reservation) error
 	CompleteRental(ctx context.Context, reservationUID uuid.UUID, status domain.ReservationStatus) error
+	Cancel(ctx context.Context, reservationUID uuid.UUID, username string) error
 }
 
 type ReservationUseCase struct {
@@ -130,6 +131,17 @@ func (useCase *ReservationUseCase) Return(
 	}
 	reservation.Status = status
 	return reservation, nil
+}
+
+// Cancel compensates a newly created rental; completed rentals are preserved.
+func (useCase *ReservationUseCase) Cancel(ctx context.Context, reservationUID uuid.UUID, username string) error {
+	if reservationUID == uuid.Nil {
+		return ErrInvalidReservation
+	}
+	if err := usernamevalidation.Validate(username); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidReservation, err)
+	}
+	return useCase.repository.Cancel(ctx, reservationUID, username)
 }
 
 func calendarDate(value time.Time) time.Time {

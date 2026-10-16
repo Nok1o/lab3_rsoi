@@ -63,6 +63,18 @@ func (repo *memoryRepo) CompleteRental(_ context.Context, uid uuid.UUID, status 
 	return nil
 }
 
+func (repo *memoryRepo) Cancel(ctx context.Context, uid uuid.UUID, username string) error {
+	item, err := repo.GetByUIDAndUsername(ctx, uid, username)
+	if err != nil {
+		return err
+	}
+	if item.Status != domain.StatusRented {
+		return domain.ErrReservationNotRented
+	}
+	delete(repo.items, uid)
+	return nil
+}
+
 func TestReservationRoutes(t *testing.T) {
 	repo := &memoryRepo{items: make(map[uuid.UUID]domain.Reservation)}
 	handler := reservationhttp.NewHandler(usecase.NewReservationUseCase(repo))
@@ -106,6 +118,7 @@ func TestReservationRoutes(t *testing.T) {
 		t.Fatalf("Location = %q, want %q", got, path)
 	}
 	assertStatus(call(http.MethodGet, path, "bob", ""), http.StatusNotFound)
+	assertStatus(call(http.MethodDelete, path, "bob", ""), http.StatusNotFound)
 	assertStatus(call(http.MethodGet, path, "alice", ""), http.StatusOK)
 	if response := call(http.MethodGet, "/api/v1/reservations/count?status=RENTED", "alice", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"count":1`) {
 		t.Fatalf("count response = %d %s", response.Code, response.Body.String())
@@ -121,5 +134,11 @@ func TestReservationRoutes(t *testing.T) {
 		t.Fatalf("return response = %s", returned.Body.String())
 	}
 	assertStatus(call(http.MethodPost, returnPath, "alice", `{"date":"`+returnDate+`"}`), http.StatusConflict)
+	assertStatus(call(http.MethodDelete, path, "alice", ""), http.StatusConflict)
+	second := call(http.MethodPost, "/api/v1/reservations", "alice", body)
+	assertStatus(second, http.StatusCreated)
+	cancelPath := second.Header().Get("Location")
+	assertStatus(call(http.MethodDelete, cancelPath, "alice", ""), http.StatusNoContent)
+	assertStatus(call(http.MethodGet, cancelPath, "alice", ""), http.StatusNotFound)
 	assertStatus(call(http.MethodGet, "/api/v1/reservations/not-a-uuid", "alice", ""), http.StatusBadRequest)
 }

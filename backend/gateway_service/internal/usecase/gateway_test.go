@@ -13,12 +13,15 @@ import (
 )
 
 type fakeLibrary struct {
-	library     domain.Library
-	book        domain.LibraryBook
-	available   int
-	returnCalls int
-	getBookErr  error
-	returnErr   error
+	library       domain.Library
+	book          domain.LibraryBook
+	available     int
+	returnCalls   int
+	getBookErr    error
+	getLibraryErr error
+	reserveErr    error
+	onReserve     func()
+	returnErr     error
 }
 
 func (service *fakeLibrary) ListLibrariesByCity(_ context.Context, city string, _ pagination.PageToken) (pagination.Page[domain.Library], error) {
@@ -36,6 +39,9 @@ func (service *fakeLibrary) ListBooksByLibrary(_ context.Context, libraryUID uui
 }
 
 func (service *fakeLibrary) GetLibraryByUID(_ context.Context, libraryUID uuid.UUID) (domain.Library, error) {
+	if service.getLibraryErr != nil {
+		return domain.Library{}, service.getLibraryErr
+	}
 	if libraryUID != service.library.Id {
 		return domain.Library{}, domain.ErrLibraryNotFound
 	}
@@ -55,6 +61,12 @@ func (service *fakeLibrary) GetBookByUID(_ context.Context, libraryUID, bookUID 
 }
 
 func (service *fakeLibrary) ReserveBook(ctx context.Context, libraryUID, bookUID uuid.UUID) (domain.LibraryBook, error) {
+	if service.onReserve != nil {
+		service.onReserve()
+	}
+	if service.reserveErr != nil {
+		return domain.LibraryBook{}, service.reserveErr
+	}
 	book, err := service.GetBookByUID(ctx, libraryUID, bookUID)
 	if err != nil {
 		return domain.LibraryBook{}, err
@@ -138,11 +150,17 @@ func (queue *fakeReturnQueue) Enqueue(_ context.Context, job ReturnJob) error {
 }
 
 type fakeReservation struct {
-	items   map[uuid.UUID]domain.Reservation
-	rentErr error
+	items       map[uuid.UUID]domain.Reservation
+	rentErr     error
+	listErr     error
+	cancelErr   error
+	cancelCalls int
 }
 
 func (service *fakeReservation) ListByUsername(_ context.Context, username string) ([]domain.Reservation, error) {
+	if service.listErr != nil {
+		return nil, service.listErr
+	}
 	items := make([]domain.Reservation, 0)
 	for _, item := range service.items {
 		if item.Username == username {
@@ -180,6 +198,25 @@ func (service *fakeReservation) Rent(_ context.Context, username string, library
 	}
 	service.items[item.Id] = item
 	return item, nil
+}
+
+func (service *fakeReservation) Cancel(ctx context.Context, reservationUID uuid.UUID, username string) error {
+	service.cancelCalls++
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if service.cancelErr != nil {
+		return service.cancelErr
+	}
+	item, err := service.GetByUIDAndUsername(ctx, reservationUID, username)
+	if err != nil {
+		return err
+	}
+	if item.Status != domain.StatusRented {
+		return domain.ErrReservationNotRented
+	}
+	delete(service.items, reservationUID)
+	return nil
 }
 
 func (service *fakeReservation) Return(_ context.Context, reservationUID uuid.UUID, username string, returnDate time.Time) (domain.Reservation, error) {
@@ -305,8 +342,90 @@ func TestRentalLimitAndCompensation(t *testing.T) {
 	if _, err := gateway.Rent(context.Background(), "alice", library.library.Id, library.book.Id, tillDate); err == nil {
 		t.Fatal("Rent() error = nil, want database error")
 	}
-	if library.available != 1 || library.returnCalls != 1 {
-		t.Fatalf("compensation failed: available=%d, returnCalls=%d", library.available, library.returnCalls)
+	if library.available != 1 || library.returnCalls != 0 || reservations.cancelCalls != 0 || len(reservations.items) != 0 {
+		t.Fatal("failed creation must not change the library or trigger compensation")
+	}
+	reservations.rentErr = nil
+	library.reserveErr = domain.ErrBookUnavailable
+	library.onReserve = func() {
+		if len(reservations.items) != 1 {
+			t.Fatal("reservation must exist before decrementing availability")
+		}
+	}
+	if _, err := gateway.Rent(context.Background(), "alice", library.library.Id, library.book.Id, tillDate); !errors.Is(err, domain.ErrBookUnavailable) {
+		t.Fatalf("failed reserve error = %v", err)
+	}
+	if len(reservations.items) != 0 || reservations.cancelCalls != 1 || library.available != 1 {
+		t.Fatal("new reservation was not cancelled")
+	}
+}
+
+func TestRentCompensatesAfterClientCancellation(t *testing.T) {
+	gateway, library, _, reservations := newTestGateway()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	library.onReserve = cancel
+	library.reserveErr = context.Canceled
+	_, err := gateway.Rent(ctx, "alice", library.library.Id, library.book.Id, time.Now())
+	if !errors.Is(err, context.Canceled) || reservations.cancelCalls != 1 || len(reservations.items) != 0 {
+		t.Fatalf("compensation after cancellation: err=%v, calls=%d, items=%v", err, reservations.cancelCalls, reservations.items)
+	}
+}
+
+func TestRentReportsFailedCompensation(t *testing.T) {
+	gateway, library, _, reservations := newTestGateway()
+	library.reserveErr = &DependencyError{Service: "library", Cause: errors.New("unavailable")}
+	reservations.cancelErr = errors.New("reservation service unavailable")
+	_, err := gateway.Rent(context.Background(), "alice", library.library.Id, library.book.Id, time.Now())
+	if err == nil || reservations.cancelCalls != 1 || len(reservations.items) != 1 {
+		t.Fatalf("failed compensation: %v", err)
+	}
+}
+
+func TestListReservationsFallsBackIndependently(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		libraryDown, bookDown bool
+	}{
+		{"library", true, false}, {"book", false, true}, {"both", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gateway, library, _, reservations := newTestGateway()
+			reservation := domain.Reservation{Id: uuid.New(), Username: "alice", LibraryId: library.library.Id, BookId: library.book.Id, Status: domain.StatusRented}
+			reservations.items[reservation.Id] = reservation
+			unavailable := &DependencyError{Service: "library", Cause: errors.New("connection refused")}
+			if test.libraryDown {
+				library.getLibraryErr = unavailable
+			}
+			if test.bookDown {
+				library.getBookErr = unavailable
+			}
+			items, err := gateway.ListReservations(context.Background(), "alice")
+			if err != nil || len(items) != 1 {
+				t.Fatalf("ListReservations = (%+v, %v)", items, err)
+			}
+			item := items[0]
+			if item.Library.Id != reservation.LibraryId || item.Book.Id != reservation.BookId {
+				t.Fatal("fallback lost identifiers")
+			}
+			if (item.Library.Name == "") != test.libraryDown || (item.Book.Name == "") != test.bookDown {
+				t.Fatalf("wrong fallback: %+v", item)
+			}
+		})
+	}
+}
+
+func TestListReservationsDoesNotHidePermanentOrPrimaryFailures(t *testing.T) {
+	gateway, library, _, reservations := newTestGateway()
+	reservation := domain.Reservation{Id: uuid.New(), Username: "alice", LibraryId: library.library.Id, BookId: library.book.Id}
+	reservations.items[reservation.Id] = reservation
+	library.getBookErr = domain.ErrBookNotFound
+	if _, err := gateway.ListReservations(context.Background(), "alice"); !errors.Is(err, domain.ErrBookNotFound) {
+		t.Fatalf("permanent error hidden: %v", err)
+	}
+	reservations.listErr = &DependencyError{Service: "reservation", Cause: errors.New("unavailable")}
+	if _, err := gateway.ListReservations(context.Background(), "alice"); !errors.Is(err, reservations.listErr) {
+		t.Fatalf("primary failure hidden: %v", err)
 	}
 }
 

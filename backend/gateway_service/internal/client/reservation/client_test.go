@@ -50,6 +50,8 @@ func TestClientOperations(t *testing.T) {
 				t.Errorf("return request = %s, %v", encoded, err)
 			}
 			code, body = http.StatusOK, returnBody
+		case request.Method == http.MethodDelete && request.URL.Path == "/api/v1/reservations/"+reservationUID.String():
+			code = http.StatusNoContent
 		default:
 			t.Errorf("unexpected request: %s %s?%s", request.Method, request.URL.Path, request.URL.RawQuery)
 			code, body = http.StatusNotFound, `{"message":"not found"}`
@@ -85,6 +87,9 @@ func TestClientOperations(t *testing.T) {
 	got, err = client.Return(ctx, reservationUID, "alice", tillDate)
 	if err != nil || got.Status != domain.StatusReturned {
 		t.Fatalf("Return = (%+v, %v)", got, err)
+	}
+	if err := client.Cancel(ctx, reservationUID, "alice"); err != nil {
+		t.Fatalf("Cancel = %v", err)
 	}
 }
 
