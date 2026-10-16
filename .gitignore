@@ -1237,5 +1237,7 @@ buildNumber.properties
 
 # Go module and database initialization scripts are application sources.
 !/backend/go.mod
+!/backend/shared/log/
+!/backend/shared/log/*.go
 !/postgres/scripts/
 !/postgres/scripts/*.sql
