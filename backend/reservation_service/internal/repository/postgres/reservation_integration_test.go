@@ -44,6 +44,7 @@ func TestReservationPGRepo(t *testing.T) {
 	if err := repository.Create(ctx, reservation); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
+
 	items, err := repository.ListByUsername(ctx, reservation.Username)
 	if err != nil || len(items) != 1 || items[0].Id != reservation.Id {
 		t.Fatalf("ListByUsername() = (%+v, %v)", items, err)
