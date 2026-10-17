@@ -11,6 +11,8 @@ const (
 // CircuitBreakerConfig configures transitions between the CLOSED, OPEN and
 // HALF_OPEN states.
 type CircuitBreakerConfig struct {
+	// FailureThreshold is the number of failures within less than one minute
+	// required to open the breaker, and the capacity of its timestamp ring.
 	FailureThreshold int
 	MaxHalfOpen      int
 	OpenTimeout      time.Duration

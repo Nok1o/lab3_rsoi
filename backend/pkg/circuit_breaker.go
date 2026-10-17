@@ -13,6 +13,8 @@ const (
 	StateOpen     State = "OPEN"
 	StateClosed   State = "CLOSED"
 	StateHalfOpen State = "HALF_OPEN"
+
+	requestWindow = time.Minute
 )
 
 var (
@@ -39,9 +41,14 @@ type CircuitBreaker struct {
 
 	state State
 
-	consecutiveFailures int
-	halfOpenRequests    int
-	halfOpenSuccesses   int
+	// results stores only failure timestamps in a fixed-size ring.
+	// resultsHead is the next write position, and the oldest entry when full.
+	results      []time.Time
+	resultsHead  int
+	resultsCount int
+
+	halfOpenRequests  int
+	halfOpenSuccesses int
 
 	generation uint64
 	openedAt   time.Time
@@ -51,10 +58,12 @@ type CircuitBreaker struct {
 }
 
 func NewCircuitBreaker(config CircuitBreakerConfig) *CircuitBreaker {
+	config = config.withDefaults()
 	return &CircuitBreaker{
 		state:      StateClosed,
+		results:    make([]time.Time, config.FailureThreshold),
 		generation: 1,
-		config:     config.withDefaults(),
+		config:     config,
 		now:        time.Now,
 	}
 }
@@ -135,14 +144,12 @@ func (cb *CircuitBreaker) afterRequest(token requestToken, outcome requestOutcom
 
 func (cb *CircuitBreaker) completeClosed(outcome requestOutcome) {
 	switch outcome {
-	case outcomeSuccess:
-		cb.consecutiveFailures = 0
 	case outcomeFailure:
-		cb.consecutiveFailures++
-		if cb.consecutiveFailures >= cb.config.FailureThreshold {
-			cb.toOpen(cb.now())
+		now := cb.now()
+		if cb.recordFailure(now) {
+			cb.toOpen(now)
 		}
-	case outcomeExcluded:
+	case outcomeSuccess, outcomeExcluded:
 		return
 	default:
 		panic("unknown circuit breaker request outcome")
@@ -157,7 +164,9 @@ func (cb *CircuitBreaker) completeHalfOpen(outcome requestOutcome) {
 			cb.toClosed()
 		}
 	case outcomeFailure:
-		cb.toOpen(cb.now())
+		now := cb.now()
+		cb.recordFailure(now)
+		cb.toOpen(now)
 	case outcomeExcluded:
 		// The excluded request did not test service health, so release its slot
 		// for another probe in this half-open generation.
@@ -173,10 +182,20 @@ func (cb *CircuitBreaker) updateState(now time.Time) {
 	}
 }
 
+// recordFailure overwrites the oldest failure in O(1), with no allocations.
+// Compare after writing so N failures, not N+1, trigger the transition.
+// Call under mu.
+func (cb *CircuitBreaker) recordFailure(now time.Time) bool {
+	cb.results[cb.resultsHead] = now
+	cb.resultsHead = (cb.resultsHead + 1) % len(cb.results)
+	cb.resultsCount = min(cb.resultsCount+1, len(cb.results))
+	return cb.resultsCount == len(cb.results) &&
+		now.Sub(cb.results[cb.resultsHead]) < requestWindow
+}
+
 func (cb *CircuitBreaker) toOpen(now time.Time) {
 	cb.state = StateOpen
 	cb.openedAt = now
-	cb.consecutiveFailures = 0
 	cb.halfOpenRequests = 0
 	cb.halfOpenSuccesses = 0
 	cb.generation++
@@ -192,7 +211,10 @@ func (cb *CircuitBreaker) toHalfOpen() {
 func (cb *CircuitBreaker) toClosed() {
 	cb.state = StateClosed
 	cb.openedAt = time.Time{}
-	cb.consecutiveFailures = 0
+	// A successful recovery starts a fresh observation window.
+	clear(cb.results)
+	cb.resultsHead = 0
+	cb.resultsCount = 0
 	cb.halfOpenRequests = 0
 	cb.halfOpenSuccesses = 0
 	cb.generation++

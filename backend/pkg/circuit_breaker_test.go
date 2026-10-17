@@ -3,6 +3,7 @@ package pkg
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -227,4 +228,149 @@ func (err testStatusError) Error() string {
 
 func (err testStatusError) StatusCode() int {
 	return int(err)
+}
+
+func TestCircuitBreakerFailureTimestampWindow(t *testing.T) {
+	for _, check := range []struct {
+		name  string
+		times []time.Duration
+		want  State
+	}{
+		{"below count threshold", []time.Duration{0, time.Second}, StateClosed},
+		{"opens on third failure", []time.Duration{0, 10 * time.Second, 20 * time.Second}, StateOpen},
+		{"exactly one minute does not open", []time.Duration{0, 20 * time.Second, time.Minute}, StateClosed},
+		{"one nanosecond below minute opens", []time.Duration{0, 20 * time.Second, time.Minute - time.Nanosecond}, StateOpen},
+		{"old failures do not open", []time.Duration{0, time.Minute, 2 * time.Minute}, StateClosed},
+		{"overwritten failures leave recent window", []time.Duration{0, 30 * time.Second, time.Minute, 90 * time.Second, 119 * time.Second}, StateOpen},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+			now := start
+			breaker := NewCircuitBreaker(CircuitBreakerConfig{FailureThreshold: 3})
+			breaker.now = func() time.Time { return now }
+			storage := &breaker.results[0]
+			callError := errors.New("unavailable")
+			for _, at := range check.times {
+				now = start.Add(at)
+				_, err := Do(breaker, func() (struct{}, error) { return struct{}{}, callError })
+				if !errors.Is(err, callError) {
+					t.Fatalf("Do() error = %v, want %v", err, callError)
+				}
+			}
+			if state := breaker.State(); state != check.want {
+				t.Fatalf("State() = %s, want %s", state, check.want)
+			}
+			if len(breaker.results) != 3 || &breaker.results[0] != storage {
+				t.Fatal("failure ring changed capacity or backing array")
+			}
+			if breaker.resultsCount != min(len(check.times), 3) {
+				t.Fatalf("stored failures = %d", breaker.resultsCount)
+			}
+			first := max(0, len(check.times)-3)
+			head := 0
+			if breaker.resultsCount == 3 {
+				head = breaker.resultsHead
+			}
+			for i, at := range check.times[first:] {
+				got := breaker.results[(head+i)%len(breaker.results)]
+				if want := start.Add(at); !got.Equal(want) {
+					t.Fatalf("failure %d timestamp = %s, want %s", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCircuitBreakerSuccessesAndExcludedErrorsDoNotChangeRing(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	breaker := NewCircuitBreaker(CircuitBreakerConfig{FailureThreshold: 2})
+	breaker.now = func() time.Time { return now }
+	callError := errors.New("unavailable")
+	_, _ = Do(breaker, func() (struct{}, error) { return struct{}{}, callError })
+	stored := append([]time.Time(nil), breaker.results...)
+	head, count := breaker.resultsHead, breaker.resultsCount
+	for _, outcome := range []error{nil, testStatusError(404), context.Canceled} {
+		now = now.Add(time.Second)
+		_, err := Do(breaker, func() (struct{}, error) { return struct{}{}, outcome })
+		if !errors.Is(err, outcome) {
+			t.Fatalf("Do() error = %v, want %v", err, outcome)
+		}
+		if breaker.resultsHead != head || breaker.resultsCount != count {
+			t.Fatal("non-failure changed ring position or count")
+		}
+		for i, timestamp := range stored {
+			if !breaker.results[i].Equal(timestamp) {
+				t.Fatal("non-failure changed a stored failure timestamp")
+			}
+		}
+	}
+	now = now.Add(time.Second)
+	_, _ = Do(breaker, func() (struct{}, error) { return struct{}{}, callError })
+	if state := breaker.State(); state != StateOpen {
+		t.Fatalf("successes reset failure history: State() = %s", state)
+	}
+}
+
+func TestCircuitBreakerRecoveryResetsFailureRing(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	breaker := NewCircuitBreaker(CircuitBreakerConfig{FailureThreshold: 2, OpenTimeout: time.Second})
+	breaker.now = func() time.Time { return now }
+	callError := errors.New("unavailable")
+	for range 2 {
+		_, _ = Do(breaker, func() (struct{}, error) { return struct{}{}, callError })
+	}
+	storage := &breaker.results[0]
+	now = now.Add(time.Second)
+	_, err := Do(breaker, func() (struct{}, error) { return struct{}{}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if breaker.State() != StateClosed || breaker.resultsCount != 0 || breaker.resultsHead != 0 {
+		t.Fatal("recovery did not reset failure ring")
+	}
+	if &breaker.results[0] != storage {
+		t.Fatal("recovery reallocated ring")
+	}
+	for _, timestamp := range breaker.results {
+		if !timestamp.IsZero() {
+			t.Fatal("recovery left old timestamps")
+		}
+	}
+	_, _ = Do(breaker, func() (struct{}, error) { return struct{}{}, callError })
+	if breaker.State() != StateClosed || breaker.resultsCount != 1 {
+		t.Fatal("old failures reopened recovered breaker")
+	}
+}
+
+func TestCircuitBreakerRecordsConcurrentFailuresOnly(t *testing.T) {
+	const requests = 100
+	breaker := NewCircuitBreaker(CircuitBreakerConfig{FailureThreshold: requests})
+	var group sync.WaitGroup
+	for i := range requests {
+		group.Go(func() {
+			_, _ = Do(breaker, func() (struct{}, error) {
+				if i%2 == 0 {
+					return struct{}{}, errors.New("unavailable")
+				}
+				return struct{}{}, nil
+			})
+		})
+	}
+	group.Wait()
+	if breaker.State() != StateClosed || breaker.resultsCount != requests/2 {
+		t.Fatalf("state=%s stored failures=%d, want CLOSED and %d", breaker.State(), breaker.resultsCount, requests/2)
+	}
+}
+
+func TestCircuitBreakerFailureThresholdDefaults(t *testing.T) {
+	for _, threshold := range []int{0, -1, 1, 128} {
+		breaker := NewCircuitBreaker(CircuitBreakerConfig{FailureThreshold: threshold})
+		want := threshold
+		if want <= 0 {
+			want = 3
+		}
+		if breaker.config.FailureThreshold != want || len(breaker.results) != want {
+			t.Fatalf("threshold %d: configured=%d ring capacity=%d, want %d", threshold, breaker.config.FailureThreshold, len(breaker.results), want)
+		}
+	}
 }
