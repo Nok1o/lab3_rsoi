@@ -8,6 +8,7 @@ on:
       - master
 permissions:
   contents: read
+  checks: write
 
 jobs:
   build:
@@ -75,7 +76,6 @@ jobs:
 
       - uses: education/autograding@v1
         id: autograder
-        continue-on-error: true
 
       # - name: Github auto grader mark
       #   if: ${{ success() && env.GOOGLE_API_KEY != '' }}
